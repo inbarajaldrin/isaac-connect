@@ -369,48 +369,50 @@ final class ViewerController: NSObject, WKNavigationDelegate, WKUIDelegate, WKSc
     private func startWatchdog() {
         watchdog?.invalidate()
         watchdog = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            let js = """
-            (()=>{const v=document.querySelector('video'); if(!v) return JSON.stringify({video:false});
-              return JSON.stringify({srcObject:!!v.srcObject,paused:v.paused,readyState:v.readyState,videoWidth:v.videoWidth,videoHeight:v.videoHeight,currentTime:v.currentTime});})()
-            """
-            self.webView.evaluateJavaScript(js) { [weak self] result, _ in
+            MainActor.assumeIsolated {
                 guard let self = self else { return }
-                let str = (result as? String) ?? "nil"
-                if let path = self.verifyPath { self.appendVerify(path, str) }
-                if self.userPaused { return }   // user disconnected this window — no auto-recover
-                guard let data = str.data(using: .utf8),
-                      let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-                let vw = (o["videoWidth"] as? Double) ?? (o["videoWidth"] as? Int).map(Double.init) ?? 0
-                let ct = (o["currentTime"] as? Double) ?? 0
-                let rs = (o["readyState"] as? Double) ?? (o["readyState"] as? Int).map(Double.init) ?? 0
+                let js = """
+                (()=>{const v=document.querySelector('video'); if(!v) return JSON.stringify({video:false});
+                  return JSON.stringify({srcObject:!!v.srcObject,paused:v.paused,readyState:v.readyState,videoWidth:v.videoWidth,videoHeight:v.videoHeight,currentTime:v.currentTime});})()
+                """
+                self.webView.evaluateJavaScript(js) { [weak self] result, _ in
+                    guard let self = self else { return }
+                    let str = (result as? String) ?? "nil"
+                    if let path = self.verifyPath { self.appendVerify(path, str) }
+                    if self.userPaused { return }   // user disconnected this window — no auto-recover
+                    guard let data = str.data(using: .utf8),
+                          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+                    let vw = (o["videoWidth"] as? Double) ?? (o["videoWidth"] as? Int).map(Double.init) ?? 0
+                    let ct = (o["currentTime"] as? Double) ?? 0
+                    let rs = (o["readyState"] as? Double) ?? (o["readyState"] as? Int).map(Double.init) ?? 0
 
-                let healthyFrame = vw > 0 && rs >= 2
-                if healthyFrame && ct > self.lastCurrentTime {
-                    // Progressing → healthy. Mark streaming, reset stall + backoff +
-                    // the acquire-failure counter (a good frame means the box is up).
-                    if !self.streaming { NSLog("IsaacConnect: streaming live (\(Int(vw))x\(Int((o["videoHeight"] as? Double) ?? 0)))") }
-                    self.streaming = true
-                    self.reconnecting = false
-                    self.backoff = 1.0
-                    self.acquireFailures = 0
-                    self.lastProgressAt = Date()
-                }
-                self.lastCurrentTime = ct
-
-                if self.streaming {
-                    // Stall: we were streaming but currentTime hasn't advanced, or video vanished.
-                    let stalledFor = Date().timeIntervalSince(self.lastProgressAt)
-                    if stalledFor > 3.0 || !healthyFrame {
-                        self.triggerRecover(reason: "video stall (\(String(format: "%.1f", stalledFor))s, vw=\(Int(vw)))")
+                    let healthyFrame = vw > 0 && rs >= 2
+                    if healthyFrame && ct > self.lastCurrentTime {
+                        // Progressing → healthy. Mark streaming, reset stall + backoff +
+                        // the acquire-failure counter (a good frame means the box is up).
+                        if !self.streaming { NSLog("IsaacConnect: streaming live (\(Int(vw))x\(Int((o["videoHeight"] as? Double) ?? 0)))") }
+                        self.streaming = true
+                        self.reconnecting = false
+                        self.backoff = 1.0
+                        self.acquireFailures = 0
+                        self.lastProgressAt = Date()
                     }
-                } else if !self.reconnecting {
-                    // Acquisition timeout: signaling connected but the server never
-                    // produced a video frame. triggerRecover counts the failure and,
-                    // after a few, asks the box status instead of looping forever.
-                    let waitedFor = Date().timeIntervalSince(self.loadedAt)
-                    if waitedFor > self.acquireTimeout {
-                        self.triggerRecover(reason: "no video within \(String(format: "%.0f", waitedFor))s of load")
+                    self.lastCurrentTime = ct
+
+                    if self.streaming {
+                        // Stall: we were streaming but currentTime hasn't advanced, or video vanished.
+                        let stalledFor = Date().timeIntervalSince(self.lastProgressAt)
+                        if stalledFor > 3.0 || !healthyFrame {
+                            self.triggerRecover(reason: "video stall (\(String(format: "%.1f", stalledFor))s, vw=\(Int(vw)))")
+                        }
+                    } else if !self.reconnecting {
+                        // Acquisition timeout: signaling connected but the server never
+                        // produced a video frame. triggerRecover counts the failure and,
+                        // after a few, asks the box status instead of looping forever.
+                        let waitedFor = Date().timeIntervalSince(self.loadedAt)
+                        if waitedFor > self.acquireTimeout {
+                            self.triggerRecover(reason: "no video within \(String(format: "%.0f", waitedFor))s of load")
+                        }
                     }
                 }
             }
@@ -515,16 +517,18 @@ final class ViewerController: NSObject, WKNavigationDelegate, WKUIDelegate, WKSc
     private func startHeartbeat() {
         heartbeat?.invalidate()
         heartbeat = Timer.scheduledTimer(withTimeInterval: 8.0, repeats: true) { [weak self] _ in
-            guard let self = self, self.remoteIdle, !self.userPaused, !self.probingStatus else { return }
-            self.probingStatus = true
-            let w = self.workstation
-            RemoteLauncher.run(verb: "status", on: w) { [weak self] r in
-                guard let self = self, self.workstation.id == w.id else { return }
-                self.probingStatus = false
-                if self.remoteIdle, !self.userPaused, r.output.lowercased().contains("running") {
-                    NSLog("IsaacConnect: \(self.workstation.name) is up again — reconnecting")
-                    self.exitIdle()
-                    self.loadRenderer()   // re-arms the watchdog
+            MainActor.assumeIsolated {
+                guard let self = self, self.remoteIdle, !self.userPaused, !self.probingStatus else { return }
+                self.probingStatus = true
+                let w = self.workstation
+                RemoteLauncher.run(verb: "status", on: w) { [weak self] r in
+                    guard let self = self, self.workstation.id == w.id else { return }
+                    self.probingStatus = false
+                    if self.remoteIdle, !self.userPaused, r.output.lowercased().contains("running") {
+                        NSLog("IsaacConnect: \(self.workstation.name) is up again — reconnecting")
+                        self.exitIdle()
+                        self.loadRenderer()   // re-arms the watchdog
+                    }
                 }
             }
         }
