@@ -1,0 +1,48 @@
+name: CI
+
+# Build-only sanity check. No signing, no notarization, no secrets — releases are
+# cut locally (see Scripts/release.sh). Runs on PRs and pushes to main only;
+# release tags are intentionally not built here (CI runners lack the Developer ID cert).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (release)
+        run: swift build -c release
+
+      - name: Shell script syntax
+        run: |
+          for script in Scripts/*.sh linux/isaac-ctl; do
+            bash -n "$script"
+          done
+
+      - name: Lint entitlements plist
+        run: plutil -lint entitlements.plist
+
+      - name: Test renderer importer
+        run: python3 -m unittest discover -s Tests -v
+
+      - name: Verify required bundle inputs exist
+        run: |
+          test -f AppIcon.icns
+          test -f Assets/Icon/AppIcon.svg
+          test -f renderer.lock.json
+          test -d Sources/IsaacConnect/Renderer
+          test -f Sources/IsaacConnect/Renderer/README.md
+
+  linux-launcher:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax
+        run: bash -n linux/isaac-ctl
+      - name: Launcher lifecycle
+        run: python3 linux/test-isaac-ctl.py

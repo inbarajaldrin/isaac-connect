@@ -1,0 +1,27 @@
+{
+  "files": {
+    "assets/renderer-BmgvXLzp.css": {
+      "sha256": "f3cc93411267e8230be9eccf2552f786365f02bfcab54619a956016377699d34",
+      "size": 232474
+    },
+    "assets/renderer-CTjqlyFI.js": {
+      "sha256": "86e69146a501dc7dcf1c3a164b01db35306bf9e78851227a66a88007d73dcc66",
+      "size": 1409881
+    },
+    "index.html": {
+      "sha256": "270d85036170549ef4cd27cb07a4ac6068d4919fd5b72fb881970080a6a15588",
+      "size": 1113
+    }
+  },
+  "notices": {
+    "NVIDIA-NOTICE.txt": "02bc9f9290990f9f73ff032997c9b7e0991b00355634b0089c8ad6adc36f2a03",
+    "THIRD-PARTY-NOTICES.txt": "d1839ee300062cb6facb520b57fd0bc42e94434537fa9db128f20ba51854b33a"
+  },
+  "source": {
+    "bundle_identifier": "com.electron.isaacsim-webrtc-streaming-client",
+    "license_url": "https://docs.isaacsim.omniverse.nvidia.com/latest/common/license-isaac-sim-webrtc-streaming-client.html",
+    "product": "NVIDIA Isaac Sim WebRTC Streaming Client",
+    "streaming_library_version": "5.12.0",
+    "version": "1.1.4"
+  }
+}

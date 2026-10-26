@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+# isaac-ctl — launch / stop / status for Isaac Sim with WebRTC streaming.
+#
+# The Linux counterpart of the macOS viewer app: the viewer invokes this over SSH
+# ("Launch Isaac Sim" / "Stop Isaac Sim" in the Workstation menu), and its
+# event-driven reconnect picks the stream up the moment :49100 goes live.
+# Also usable directly:  isaac-ctl launch|stop|status|restart
+#
+# Distilled from a battle-tested project launcher (prismatic-manipulation); the
+# non-obvious flags below each carry a verified lesson — don't "simplify" them.
+#
+# Verbs:
+#   launch [--app isaacsim] [--wait]   start Isaac Sim streaming (webrtc, headless).
+#                                      Returns right after spawn by default (the
+#                                      viewer auto-connects when ready); --wait
+#                                      blocks until the stream port listens.
+#   run <base64-cmd> [--wait]          run an ARBITRARY command (base64-encoded to
+#                                      dodge quoting) under the SAME pidfile, so
+#                                      stop/status stay uniform. This is the custom
+#                                      launch-profile path (e.g. an Isaac Lab
+#                                      training script: LIVESTREAM=2 … python …).
+#                                      NO isaacsim env guards — the command owns its
+#                                      own env (the static-TLS tunable in `launch`
+#                                      would break Lab GPU physics; see below).
+#   stop                               graceful TERM (then KILL) of the launched pid
+#   status                             "running pid=… stream=ip:port" / "stopped"
+#                                      exit 0 = running, 1 = stopped
+#   restart [--wait]                   stop + launch
+#
+# Machine config (optional): ~/.config/isaac-ctl.conf — plain KEY=VALUE, sourced.
+#   ISAACSIM_BIN=~/env_isaaclab/bin/isaacsim   # the pip-installed `isaacsim` CLI
+#   ISAACSIM_STREAM_IP=…                       # default: this box's tailscale IP
+#   ISAACSIM_STREAM_PORT=49100
+#   ISAACSIM_KIT_MCP_EXT_FOLDER=…              # override ONLY for boxes that never ran
+#                                              # omni-kit-mcp's scripts/install.py — that
+#                                              # installer registers the bridge persistently
+#                                              # in user.config.json, so plain launches are
+#                                              # already MCP-ready with no flags here
+#   ISAACSIM_EXTRA_ARGS=…                      # appended verbatim (project exts, etc.)
+#
+# --app is reserved for future profiles (e.g. isaaclab); only "isaacsim" exists today.
+# (isaaclab profile is scaffolded but deferred: Lab standalone scripts stream the
+#  same webrtc protocol via LIVESTREAM=2, so VIEWING a Lab box already works.)
+set -eo pipefail
+
+CONF="${ISAAC_CTL_CONF:-$HOME/.config/isaac-ctl.conf}"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+RUNDIR="${XDG_RUNTIME_DIR:-/tmp}"
+PIDFILE="$RUNDIR/isaac-ctl.pid"
+LOG="${ISAAC_CTL_LOG:-/tmp/isaac-ctl.log}"
+
+# ---- resolve the Isaac Sim binary ----
+# The conf's ISAACSIM_BIN (written by setup, which detected the install) is the
+# SOURCE OF TRUTH. Everything below is best-effort fallback for unconfigured
+# boxes: PATH entries are symlink-resolved, and shell-script wrappers (a bash
+# script that itself launches isaacsim — a launcher, not an install) are refused.
+# Never assume a venv name or python version — the venv globs are convention
+# guesses (NVIDIA doc examples: env_isaaclab for pip-Lab, env_isaacsim for
+# pip-standalone), nothing more.
+resolve_bin() {
+    if [ -n "${ISAACSIM_BIN:-}" ]; then echo "$ISAACSIM_BIN"; return; fi
+    local c
+    if c="$(command -v isaacsim 2>/dev/null)"; then
+        c="$(readlink -f "$c")"
+        if [ -x "$c" ] && ! head -1 "$c" 2>/dev/null | grep -qE '^#!.*\b(ba)?sh\b'; then
+            echo "$c"; return
+        fi
+    fi
+    for c in "$HOME/env_isaaclab/bin/isaacsim" "$HOME/env_isaacsim/bin/isaacsim"; do
+        [ -x "$c" ] && { echo "$c"; return; }
+    done
+    echo ""
+}
+
+# Exact-pid check via pidfile — NOT pgrep -f, which false-positives on launcher
+# wrappers / stale wait-loops / your own grep, and silently blocks every relaunch.
+running_pid() {
+    local pid
+    pid="$(cat "$PIDFILE" 2>/dev/null)" || return 1
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && echo "$pid"
+}
+
+stream_ip() {
+    local ip="${ISAACSIM_STREAM_IP:-}"
+    [ -z "$ip" ] && command -v tailscale >/dev/null 2>&1 && ip="$(tailscale ip -4 2>/dev/null | head -1)"
+    echo "${ip:-127.0.0.1}"
+}
+
+# Is a webrtc stream already live on the port — regardless of who started it? Lets
+# status/launch see a sim launched OUTSIDE isaac-ctl (e.g. by hand on the box), so
+# we report reality and never start a second sim that would fight for the port.
+stream_up() {
+    local port="${ISAACSIM_STREAM_PORT:-49100}"
+    (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && { exec 3>&- 3<&-; return 0; }
+    return 1
+}
+
+do_launch() {
+    local wait_ready=0 app="isaacsim"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --wait) wait_ready=1; shift ;;
+            --app)  app="$2"; shift 2 ;;
+            *) echo "unknown arg: $1" >&2; exit 2 ;;
+        esac
+    done
+    [ "$app" = "isaacsim" ] || { echo "ERROR: unknown app profile '$app' (only: isaacsim)" >&2; exit 2; }
+
+    if pid="$(running_pid)"; then
+        echo "already running pid=$pid stream=$(stream_ip):${ISAACSIM_STREAM_PORT:-49100}"
+        return 0
+    fi
+    if stream_up; then
+        echo "a stream is already live on :${ISAACSIM_STREAM_PORT:-49100} (started outside isaac-ctl) — stop it first"
+        return 0
+    fi
+
+    local bin; bin="$(resolve_bin)"
+    [ -n "$bin" ] && [ -x "$bin" ] || {
+        echo "ERROR: isaacsim binary not found — set ISAACSIM_BIN in $CONF" >&2; exit 1; }
+
+    local ip port
+    ip="$(stream_ip)"
+    port="${ISAACSIM_STREAM_PORT:-49100}"
+
+    # publicEndpointAddress is REQUIRED for a remote client: without it Kit's SDP
+    # offer carries c=IN IP4 0.0.0.0 with zero ICE candidates and the peer loops
+    # NVST_CCE_DISCONNECTED. APP-namespaced key ONLY — the EXT key (--/exts/
+    # omni.kit.livestream.webrtc/…/publicIp) breaks NVST.
+    #
+    # outDirectory → non-writable dir: libNvStreamServer leaks one ~13MB encrypted
+    # .etli blob per connect/disconnect and NO kit setting gates it; pointing the
+    # writer at an unwritable dir makes its openat fail EACCES and it silently
+    # gives up (streaming unaffected).
+    local etli="${ISAACSIM_NVST_DIR:-/tmp/nvst-blocked}"
+    mkdir -p "$etli" 2>/dev/null || true
+    chmod 0555 "$etli" 2>/dev/null || true
+
+    # enable_async=false: Isaac Sim 5.x async-rendering deadlock (NVIDIA forum
+    # 349513) — reset()/play() deadlocks compiling an external MDL material.
+    local args="--enable omni.kit.livestream.webrtc --no-window"
+    args="$args --/app/livestream/publicEndpointAddress=$ip"
+    args="$args --/app/livestream/port=$port"
+    args="$args --/app/livestream/outDirectory=$etli"
+    args="$args --/exts/isaacsim.core.throttling/enable_async=false"
+    args="$args --/persistent/omni/replicator/captureOnPlay=0"
+
+    # omni-kit-mcp bridge override — NOT needed on boxes that ran omni-kit-mcp's
+    # scripts/install.py (the bridge autoloads from user.config.json there).
+    if [ -n "${ISAACSIM_KIT_MCP_EXT_FOLDER:-}" ] && [ -d "$ISAACSIM_KIT_MCP_EXT_FOLDER" ]; then
+        args="--ext-folder $ISAACSIM_KIT_MCP_EXT_FOLDER --enable omni.kit.mcp $args"
+    fi
+    args="$args ${ISAACSIM_EXTRA_ARGS:-}"
+
+    # Long-session malloc growth mitigation + no .pyc litter from Kit's imports.
+    # (Set BEFORE the ros2 TLS guard below, which APPENDS to GLIBC_TUNABLES —
+    #  the other order would make this default-assignment a no-op.)
+    export GLIBC_TUNABLES="${GLIBC_TUNABLES:-glibc.malloc.arena_max=1:glibc.malloc.mmap_max=0:glibc.malloc.mmap_threshold=2147483647}"
+    export PYTHONDONTWRITEBYTECODE=1
+
+    # ros2.bridge crash guards — unconditional FOR THIS PROFILE (isaacsim
+    # full-app), and PER-PROFILE by design. Boxes enable the bridge persistently
+    # (versioned ext id in Kit's user.config.json), which sails past any
+    # flag/conf inspection, so gating these on EXTRA_ARGS would crash exactly
+    # those launches. What they fix: the bridge's rmw/rcl/cyclone dlopens exhaust
+    # glibc's static-TLS surplus on top of Isaac+torch (fatal
+    # `_dl_allocate_tls_init` assertion), and torch's libcusparse needs the
+    # venv's nvjitlink resolved FIRST (else ImportError `__nvJitLinkCreate_12_8`
+    # corrupts linker state en route to the same crash).
+    #
+    # ⚠ The static-TLS tunable is NOT universally benign: under Isaac Lab
+    # standalone runs with GPU PhysX, glibc carves the 2MB surplus out of each
+    # new thread's stack, the PhysX GPU dispatcher thread's pthread_create fails,
+    # and PxThreadImpl::start spins forever (the "reset() hang", root-caused
+    # 2026-07-05 on a4500). The future `--app isaaclab` profile MUST NOT export
+    # it (the nvjitlink preload is fine either way). Launcher-scoped, per-profile
+    # env is the only correct home — never blanket env files like a venv's
+    # activate. (ld.so consumes these pre-process, so Kit config can't hold them.)
+    export GLIBC_TUNABLES="${GLIBC_TUNABLES:+$GLIBC_TUNABLES:}glibc.rtld.optional_static_tls=2097152"
+    _venv="$(dirname "$(dirname "$bin")")"
+    _nvjitlink="$(ls "$_venv"/lib/python3.*/site-packages/nvidia/nvjitlink/lib/libnvJitLink.so.12 2>/dev/null | head -1 || true)"
+    [ -f "$_nvjitlink" ] && export LD_PRELOAD="${_nvjitlink}${LD_PRELOAD:+:$LD_PRELOAD}"
+
+    echo "launching: $bin (stream $ip:$port, log $LOG)"
+    # shellcheck disable=SC2086
+    # Keep the sim alive after the SSH command or agent runner exits.
+    nohup setsid "$bin" $args > "$LOG" 2>&1 &
+    echo "$!" > "$PIDFILE"
+    sleep 2
+    if ! pid="$(running_pid)"; then
+        echo "ERROR: isaacsim exited immediately; last log lines:" >&2
+        tail -10 "$LOG" | sed 's/^/  /' >&2
+        exit 1
+    fi
+    echo "launched pid=$pid stream=$ip:$port"
+
+    if [ "$wait_ready" = "1" ]; then
+        echo "waiting for stream :$port …"
+        for _ in $(seq 1 60); do
+            if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then exec 3>&- 3<&-; echo "ready"; return 0; fi
+            pid="$(running_pid)" || { echo "ERROR: isaacsim exited; see $LOG" >&2; exit 1; }
+            sleep 5
+        done
+        echo "ERROR: stream :$port not listening within timeout; see $LOG" >&2; exit 1
+    fi
+}
+
+# Generic launch of a custom profile command (base64-encoded to survive the
+# ssh→sh quoting layers cleanly). Shares the pidfile + wait/exit plumbing with
+# do_launch, so `status`/`stop` treat a custom launch identically. Deliberately
+# applies NO env (no malloc tunables, no static-TLS bump, no nvjitlink preload):
+# a custom command — a Lab training script, a bespoke Kit app — carries whatever
+# env it needs (Lab sets LIVESTREAM=2 itself), and the static-TLS tunable would
+# actively break Lab's GPU PhysX. Single pidfile = one launch per box at a time,
+# which matches the single-session :49100 constraint (Sim and a Lab run can't
+# both hold the stream anyway — stop one before launching the other).
+do_run() {
+    local b64="${1:-}"; shift || true
+    [ -n "$b64" ] || { echo "ERROR: run needs a base64-encoded command" >&2; exit 2; }
+    local wait_ready=0
+    [ "${1:-}" = "--wait" ] && wait_ready=1
+
+    if pid="$(running_pid)"; then
+        echo "already running pid=$pid — stop it before launching another profile" >&2
+        exit 1
+    fi
+    if stream_up; then
+        echo "a stream is already live on :${ISAACSIM_STREAM_PORT:-49100} (started outside isaac-ctl) — stop it first" >&2
+        exit 1
+    fi
+
+    local cmd
+    cmd="$(printf '%s' "$b64" | base64 -d 2>/dev/null)" || {
+        echo "ERROR: could not base64-decode the command" >&2; exit 2; }
+    [ -n "$cmd" ] || { echo "ERROR: empty command after decode" >&2; exit 2; }
+
+    echo "running custom profile (log $LOG): $cmd"
+    nohup setsid bash -lc "$cmd" > "$LOG" 2>&1 &
+    echo "$!" > "$PIDFILE"
+    sleep 2
+    local pid
+    if ! pid="$(running_pid)"; then
+        echo "ERROR: command exited immediately; last log lines:" >&2
+        tail -10 "$LOG" | sed 's/^/  /' >&2
+        exit 1
+    fi
+    echo "launched pid=$pid stream=$(stream_ip):${ISAACSIM_STREAM_PORT:-49100}"
+
+    if [ "$wait_ready" = "1" ]; then
+        local port="${ISAACSIM_STREAM_PORT:-49100}"
+        echo "waiting for stream :$port …"
+        for _ in $(seq 1 90); do
+            if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then exec 3>&- 3<&-; echo "ready"; return 0; fi
+            pid="$(running_pid)" || { echo "ERROR: command exited; see $LOG" >&2; exit 1; }
+            sleep 5
+        done
+        echo "ERROR: stream :$port not listening within timeout; see $LOG" >&2; exit 1
+    fi
+}
+
+do_stop() {
+    local pid
+    if ! pid="$(running_pid)"; then echo "stopped (not running)"; rm -f "$PIDFILE"; return 0; fi
+    echo "stopping pid=$pid …"
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "still up after 10s — SIGKILL"
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PIDFILE"
+    echo "stopped"
+}
+
+do_status() {
+    local pid port; port="${ISAACSIM_STREAM_PORT:-49100}"
+    if pid="$(running_pid)"; then
+        echo "running pid=$pid stream=$(stream_ip):$port"
+        return 0
+    fi
+    # No ctl pidfile, but a stream may be live from a sim started by hand / another
+    # tool. Report it as running so the viewer connects instead of parking idle.
+    if stream_up; then
+        echo "running stream=$(stream_ip):$port (started outside isaac-ctl)"
+        return 0
+    fi
+    echo "stopped"
+    return 1
+}
+
+case "${1:-}" in
+    launch)  shift; do_launch "$@" ;;
+    run)     shift; do_run "$@" ;;
+    stop)    do_stop ;;
+    status)  do_status ;;
+    restart) shift; do_stop; do_launch "$@" ;;
+    *) echo "usage: isaac-ctl launch [--app isaacsim] [--wait] | run <base64-cmd> [--wait] | stop | status | restart [--wait]" >&2; exit 2 ;;
+esac

@@ -1,0 +1,22 @@
+# Swift build output
+.build/
+
+# Assembled / built app bundle (produced by build.sh)
+*.app/
+
+# Release artifacts (produced by release.sh)
+*.zip
+*.zip.sha256
+*.dmg
+
+.DS_Store
+__pycache__/
+
+# NVIDIA renderer payload and generated notices are imported locally.
+/Sources/IsaacConnect/Renderer/*
+!/Sources/IsaacConnect/Renderer/README.md
+
+# Keep icon explorations locally; publish the selected vector and root ICNS.
+/Assets/Icon/*
+!/Assets/Icon/AppIcon.svg
+/Scripts/preview-*.py
