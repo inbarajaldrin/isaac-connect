@@ -54,7 +54,11 @@ fi
 SIGN_ID="$SIGN_ID" VERSION="$VERSION" BUILD="${BUILD:-1}" ./Scripts/build.sh
 
 # Distribution requires a real Developer ID signature, not Apple Development.
-if ! codesign -dvvv "$APP" 2>&1 | grep -q "Developer ID Application"; then
+if ! SIGNATURE_INFO="$(codesign -dvvv "$APP" 2>&1)"; then
+  printf '%s\n' "$SIGNATURE_INFO" >&2
+  exit 1
+fi
+if [[ "$SIGNATURE_INFO" != *"Authority=Developer ID Application:"* ]]; then
   echo "ERROR: '$APP' is not Developer ID signed."
   echo "Create the cert (Xcode ▸ Settings ▸ Accounts ▸ Manage Certificates ▸ + Developer ID Application) and re-run."
   exit 1
