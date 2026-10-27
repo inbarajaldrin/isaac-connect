@@ -9,6 +9,10 @@ with automatic reconnect and saved connections.
 
 **[Download for Apple silicon](https://github.com/inbarajaldrin/isaac-connect/releases/latest)** · macOS 14 or later
 
+![Isaac Connect showing a Franka Panda robot scene with the Stage, Property, and Content panels visible](docs/images/isaac-connect-franka.png)
+
+*A Franka Panda scene streamed from a remote NVIDIA Isaac Sim workstation.*
+
 ## Features
 
 - Save and switch between workstations.
